@@ -3,29 +3,48 @@
 from cloudbrain.settings import RABBITMQ_ADDRESS
 
 import pika
-
 import json
+import logging
 
-import sockjs.tornado
-
-import tornado.ioloop
-import tornado.web
+from sockjs.tornado.conn import SockJSConnection
+from sockjs.tornado import SockJSRouter
+from tornado.ioloop import PeriodicCallback, IOLoop
+from tornado.web import RequestHandler, Application
 
 from cloudbrain.subscribers.SubscriberInterface import Subscriber
 
-class RtStreamConnection(sockjs.tornado.SockJSConnection):
+SERVER_PORT = 31415
+logging.getLogger().setLevel(logging.INFO)
+
+
+
+class RtStreamConnection(SockJSConnection):
     """RtStreamConnection connection implementation"""
     # Class level variable
     clients = set()
 
     def __init__(self, session):
         super(self.__class__, self).__init__(session)
-        self.subscriber = None
+        self.subscribers = {}
+
+
+    def send_probe_factory(self, metric_name):
+
+        def send_probe(body):
+            logging.debug("GOT: " + body)
+            buffer_content = json.loads(body)
+
+            for record in buffer_content:
+                record["metric"] = metric_name
+                self.send(json.dumps(record))
+
+        return send_probe
+
 
     def on_open(self, info):
         logging.info("Got a new connection...")
         self.clients.add(self)
-        # self.timeout = tornado.ioloop.PeriodicCallback(self.send_heartbeat, 1000)
+        # self.timeout = PeriodicCallback(self.send_heartbeat, 1000)
         # self.timeout.start()
 
     # This will receive instructions from the client to change the
@@ -45,28 +64,24 @@ class RtStreamConnection(sockjs.tornado.SockJSConnection):
         device_id = stream_configuration['deviceId']
         metric = stream_configuration['metric']
 
-        if self.subscriber is not None:
-            self.subscriber.disconnect()
-            self.subscriber = None
+        if metric not in self.subscribers:
+            self.subscribers[metric] = TornadoSubscriber(callback=self.send_probe_factory(metric),
+                                       device_name=device_name,
+                                       device_id=device_id,
+                                       rabbitmq_address=RABBITMQ_ADDRESS,
+                                       metric_name=metric)
 
-        self.subscriber = TornadoSubscriber(callback=self.send_probe,
-                                         device_name=device_name,
-                                         device_id=device_id,
-                                         rabbitmq_address=RABBITMQ_ADDRESS,
-                                         metric_name=metric)
-        self.subscriber.connect()
 
-    def send_probe(self, body):
-        #logging.info("GOT: " + body)
-        buffer_content = json.loads(body)
-        for record in buffer_content:
-            record["metric"] = "eeg"; # TODO: Temporary fake EEG metric ALWAYS!
-            self.send(json.dumps(record))
+            self.subscribers[metric].connect()
+
+
 
     def on_close(self):
-        if self.subscriber is not None:
-            self.subscriber.disconnect()
-            self.subscriber = None
+        for (metric, subscriber) in self.subscribers.keys():
+          if subscriber is not None:
+              subscriber.disconnect()
+
+        self.subscribers = {}
         #self.timeout.stop()
         self.clients.remove(self)
 
@@ -74,12 +89,12 @@ class RtStreamConnection(sockjs.tornado.SockJSConnection):
         self.broadcast(self.clients, 'message')
 
 
-class MockHandler(tornado.web.RequestHandler):
+class MockHandler(RequestHandler):
     """Just a mock page to test it out..."""
     def get(self):
         self.render('mock.html')
 
-class RtDataStreamHandler(tornado.web.RequestHandler):
+class RtDataStreamHandler(RequestHandler):
     """
     Just a custom handler for the rt-data-stream.js file :)
     """
@@ -99,8 +114,10 @@ class TornadoSubscriber(object):
 
         self.connection = None
         self.channel = None
+
         self.host = RABBITMQ_ADDRESS
         self.queue_name = None
+
 
     def connect(self):
         credentials = pika.PlainCredentials('cloudbrain', 'cloudbrain')
@@ -108,7 +125,7 @@ class TornadoSubscriber(object):
                                         host=self.host, credentials=credentials),
                                         self.on_connected,
                                         stop_ioloop_on_close=False,
-                                        custom_ioloop=tornado.ioloop.IOLoop.instance())
+                                        custom_ioloop=IOLoop.instance())
 
     def disconnect(self):
         if self.connection is not None:
@@ -167,20 +184,20 @@ class TornadoSubscriber(object):
         self.channel.basic_ack(delivery_tag)
 
 if __name__ == "__main__":
-    import logging
-
-    logging.getLogger().setLevel(logging.DEBUG)
 
     # 1. Create chat router
-    RtStreamRouter = sockjs.tornado.SockJSRouter(RtStreamConnection, '/rt-stream')
+    RtStreamRouter = SockJSRouter(RtStreamConnection, '/rt-stream')
 
     # 2. Create Tornado application
-    app = tornado.web.Application(
+    app = Application(
             [(r"/", MockHandler), (r"/rt-data-stream.js", RtDataStreamHandler)] + RtStreamRouter.urls
     )
 
     # 3. Make Tornado app listen on Pi
-    app.listen(31415)
+    app.listen(SERVER_PORT)
+
+    print "Real-time data server running at http://localhost:%s" %SERVER_PORT
 
     # 4. Start IOLoop
-    tornado.ioloop.IOLoop.instance().start()
+    IOLoop.instance().start()
+
